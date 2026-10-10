@@ -32,6 +32,8 @@ WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
 std::vector<Sensor> sensors;
 std::array<Reading, kMaxSensors> readings;
+std::array<String, kMaxSensors> sensorStatus;
+std::array<uint32_t, kMaxSensors> lastSampleMs{};
 portMUX_TYPE readingMux = portMUX_INITIALIZER_UNLOCKED;
 volatile int activeSensor = -1;
 String wifiSsid, wifiPassword, mqttHost, mqttUsername, mqttPassword, availabilityTopic;
@@ -175,6 +177,11 @@ String pageStart(const char* title) {
 
 void handleRoot() {
   String page = pageStart("CTEK gateway configuratie");
+  page += F("<p>Wi-Fi: ");
+  page += WiFi.status() == WL_CONNECTED ? String("verbonden") : String("niet verbonden");
+  page += F(" | MQTT: ");
+  if (mqtt.connected()) page += F("verbonden");
+  else page += String("niet verbonden (status ") + mqtt.state() + ")";
   page += F("<form method='post' action='/save'><fieldset><legend>Wi-Fi</legend><label>Netwerknaam<input name='ssid' required value='");
   page += escapeHtml(wifiSsid);
   page += F("'></label><label>Wi-Fi-wachtwoord<input name='wifi_password' type='password' placeholder='Leeg laten om ongewijzigd te laten'></label></fieldset><fieldset><legend>MQTT / Home Assistant</legend><label>Brokeradres<input name='mqtt_host' value='");
@@ -189,7 +196,9 @@ void handleRoot() {
   for (size_t i = 0; i < sensors.size(); ++i) {
     page += F("<li>"); page += escapeHtml(sensors[i].name); page += F(" (");
     page += escapeHtml(sensors[i].address); page += F(") <a href='/remove?i=");
-    page += String(i); page += F("'>verwijderen</a></li>");
+    page += String(i); page += F("'>verwijderen</a><br><small>");
+    page += escapeHtml(sensorStatus[i].isEmpty() ? String("Nog geen uitleespoging") : sensorStatus[i]);
+    page += F("</small></li>");
   }
   page += F("</ul><small>Configuratie wordt lokaal op de gateway bewaard.</small></body></html>");
   web.send(200, "text/html; charset=utf-8", page);
@@ -229,6 +238,11 @@ void handleAdd() {
   if (name.isEmpty()) name = "CTEK " + address.substring(address.length() - 5);
   sensors.push_back({address, name, code});
   saveSensors();
+  if (mqtt.connected()) {
+    const size_t index = sensors.size() - 1;
+    publishDiscovery(index, "voltage", "voltage", "voltage", "V", "voltage", "mdi:car-battery");
+    publishDiscovery(index, "temperature", "temperature", "temperature", "°C", "temperature", "mdi:thermometer");
+  }
   web.sendHeader("Location", "/");
   web.send(303);
 }
@@ -340,31 +354,46 @@ void onBatterySamples(NimBLERemoteCharacteristic*, uint8_t* data, size_t length,
     readings[index].voltage = (static_cast<uint16_t>(data[offset + 1]) * 256 + data[offset]) / 2048.0f;
     readings[index].temperature = static_cast<int8_t>(data[offset + 2]) / 2.0f;
     readings[index].pending = true;
+    lastSampleMs[index] = millis();
   }
   portEXIT_CRITICAL(&readingMux);
 }
 
 void readOneSensor(size_t index) {
+  sensorStatus[index] = "Bezig met BLE-verbinding";
   if (WiFi.status() == WL_CONNECTED) mqtt.loop();
   NimBLEClient* client = NimBLEDevice::createClient();
-  if (!client) return;
+  if (!client) {
+    sensorStatus[index] = "BLE-client kon niet worden aangemaakt";
+    return;
+  }
   if (!client->connect(NimBLEAddress(std::string(sensors[index].address.c_str()), BLE_ADDR_PUBLIC))) {
+    sensorStatus[index] = "BLE-verbinding mislukt";
     NimBLEDevice::deleteClient(client);
     return;
   }
   NimBLERemoteService* service = client->getService(NimBLEUUID(kServiceUuid));
   if (!service) {
+    sensorStatus[index] = "Verbonden, maar CTEK GATT-service niet gevonden";
     client->disconnect();
     NimBLEDevice::deleteClient(client);
     return;
   }
   NimBLERemoteCharacteristic* unlock = service->getCharacteristic(NimBLEUUID(kUnlockUuid));
   NimBLERemoteCharacteristic* samples = service->getCharacteristic(NimBLEUUID(kSamplesUuid));
-  if (!unlock || !samples || !unlockSensor(unlock, sensors[index].code)) {
+  if (!unlock || !samples) {
+    sensorStatus[index] = "CTEK GATT-characteristieken ontbreken";
     client->disconnect();
     NimBLEDevice::deleteClient(client);
     return;
   }
+  if (!unlockSensor(unlock, sensors[index].code)) {
+    sensorStatus[index] = "Unlock-write mislukt; controleer de verbindingscode";
+    client->disconnect();
+    NimBLEDevice::deleteClient(client);
+    return;
+  }
+  sensorStatus[index] = "Unlock verstuurd; meetdata opvragen";
 
   uint32_t unlockWaitStarted = millis();
   while (millis() - unlockWaitStarted < 2000) {
@@ -389,12 +418,16 @@ void readOneSensor(size_t index) {
     }
   }
   activeSensor = static_cast<int>(index);
-  if (samples->canNotify() && samples->subscribe(true, onBatterySamples, true) && historyCursor > 0) {
+  const uint32_t previousSampleMs = lastSampleMs[index];
+  const bool subscribed = samples->canNotify() && samples->subscribe(true, onBatterySamples, true);
+  sensorStatus[index] = subscribed ? "Voltage-notificaties actief; wachten op meting" : "Voltage-notificaties inschakelen mislukt";
+  if (subscribed && historyCursor > 0) {
     if (auto* range = service->getCharacteristic(NimBLEUUID(kRangeUuid))) {
       const uint16_t firstSample = historyCursor - 1;
       const uint8_t request[] = {3, static_cast<uint8_t>(firstSample),
                                  static_cast<uint8_t>(firstSample >> 8), 1, 0};
-      range->writeValue(request, sizeof(request), true);
+      if (!range->writeValue(request, sizeof(request), true))
+        sensorStatus[index] = "Meetdata-opvraag mislukt";
     }
   }
   uint32_t started = millis();
@@ -404,6 +437,9 @@ void readOneSensor(size_t index) {
     publishPending();
     delay(20);
   }
+  sensorStatus[index] = lastSampleMs[index] != previousSampleMs
+      ? "Meetnotificatie ontvangen"
+      : String("Geen voltage-notificatie ontvangen (cursor ") + historyCursor + ")";
   activeSensor = -1;
   if (client->isConnected()) client->disconnect();
   NimBLEDevice::deleteClient(client);
