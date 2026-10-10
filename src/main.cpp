@@ -23,7 +23,16 @@ constexpr char kDevicePrefix[] = "2C:FC:E4";
 constexpr size_t kMaxSensors = 8;
 constexpr uint32_t kListenDurationMs = 8000;
 
-struct Sensor { String address; String name; String code; };
+struct Sensor {
+  String address;
+  String name;
+  String code;
+  uint8_t addressType;
+
+  Sensor(String sensorAddress, String sensorName, String senderCode, uint8_t type = BLE_ADDR_PUBLIC)
+      : address(std::move(sensorAddress)), name(std::move(sensorName)),
+        code(std::move(senderCode)), addressType(type) {}
+};
 struct Reading { float voltage = 0; float temperature = 0; bool pending = false; };
 
 Preferences preferences;
@@ -70,8 +79,9 @@ void loadConfiguration() {
     if (sensors.size() >= kMaxSensors) break;
     String address = normalizeAddress(item["address"] | "");
     String code = item["code"] | "";
+    uint8_t addressType = item["address_type"] | BLE_ADDR_PUBLIC;
     if (isCtekAddress(address) && code.length() == 16)
-      sensors.push_back({address, item["name"] | address, code});
+      sensors.push_back({address, item["name"] | address, code, addressType});
   }
 }
 
@@ -81,6 +91,7 @@ void saveSensors() {
   for (const Sensor& sensor : sensors) {
     JsonObject item = array.add<JsonObject>();
     item["address"] = sensor.address;
+    item["address_type"] = sensor.addressType;
     item["name"] = sensor.name;
     item["code"] = sensor.code;
   }
@@ -227,7 +238,9 @@ void handleAdd() {
   String address = normalizeAddress(web.arg("address"));
   String code = web.arg("code");
   String name = web.arg("name");
-  if (!isCtekAddress(address) || code.length() != 16 || sensors.size() >= kMaxSensors) {
+  const int requestedAddressType = web.arg("address_type").toInt();
+  if (!isCtekAddress(address) || code.length() != 16 || sensors.size() >= kMaxSensors ||
+      requestedAddressType < BLE_ADDR_PUBLIC || requestedAddressType > BLE_ADDR_RANDOM_ID) {
     web.send(400, "text/plain; charset=utf-8", "Ongeldig CTEK-adres, code moet 16 tekens zijn, of maximum van 8 bereikt.");
     return;
   }
@@ -236,7 +249,7 @@ void handleAdd() {
     return;
   }
   if (name.isEmpty()) name = "CTEK " + address.substring(address.length() - 5);
-  sensors.push_back({address, name, code});
+  sensors.push_back({address, name, code, static_cast<uint8_t>(requestedAddressType)});
   saveSensors();
   if (mqtt.connected()) {
     const size_t index = sensors.size() - 1;
@@ -270,12 +283,15 @@ void handleScan() {
   String page = pageStart("CTEK-apparaten zoeken");
   page += F("<p>BLE-apparaten gevonden: ");
   page += String(found.getCount());
-  page += F(". CTEK-herkenning gebruikt adresprefix 2C:FC:E4.</p><ul>");
+  page += F(". CTEK-herkenning gebruikt adresprefix 2C:FC:E4. BLE-adrestype staat tussen haakjes.</p><ul>");
+  bool savedAddressTypeChanged = false;
   for (int i = 0; i < found.getCount(); ++i) {
     const NimBLEAdvertisedDevice* device = found.getDevice(i);
-    String address = normalizeAddress(device->getAddress().toString().c_str());
+    const NimBLEAddress bleAddress = device->getAddress();
+    String address = normalizeAddress(bleAddress.toString().c_str());
+    const uint8_t addressType = bleAddress.getType();
     String name = device->getName().c_str();
-    Serial.printf("[SCAN] %s %s RSSI=%d\n", address.c_str(), name.c_str(), device->getRSSI());
+    Serial.printf("[SCAN] %s %s RSSI=%d type=%u\n", address.c_str(), name.c_str(), device->getRSSI(), addressType);
     if (!isCtekAddress(address)) {
       page += F("<li>");
       page += escapeHtml(name.isEmpty() ? String("(geen naam)") : name);
@@ -287,22 +303,34 @@ void handleScan() {
       continue;
     }
     bool exists = false;
-    for (const Sensor& sensor : sensors) exists |= sensor.address == address;
+    for (Sensor& sensor : sensors) {
+      if (sensor.address != address) continue;
+      exists = true;
+      if (sensor.addressType != addressType) {
+        sensor.addressType = addressType;
+        savedAddressTypeChanged = true;
+      }
+    }
     if (exists || sensors.size() >= kMaxSensors) {
       page += F("<li>");
       page += escapeHtml(name.isEmpty() ? String("CTEK Battery Sense") : name);
       page += F(" | ");
       page += escapeHtml(address);
-      page += exists ? F(" | al toegevoegd</li>") : F(" | maximum bereikt</li>");
+      page += F(" (");
+      page += String(addressType);
+      page += exists ? F(") | al toegevoegd</li>") : F(") | maximum bereikt</li>");
       continue;
     }
     page += F("<li><form method='post' action='/add'><strong>");
     page += escapeHtml(name.isEmpty() ? String("CTEK Battery Sense") : name);
     page += F("</strong> "); page += escapeHtml(address);
+    page += F(" ("); page += String(addressType); page += F(")");
     page += F("<input type='hidden' name='address' value='"); page += escapeHtml(address);
+    page += F("'><input type='hidden' name='address_type' value='"); page += String(addressType);
     page += F("'><label>Naam<input name='name' value='"); page += escapeHtml(name);
     page += F("'></label><label>Verbindingscode (16 tekens)<input name='code' required minlength='16' maxlength='16' autocomplete='off'></label><button type='submit'>Toevoegen</button></form></li>");
   }
+  if (savedAddressTypeChanged) saveSensors();
   if (found.getCount() == 0) page += F("<li>Geen BLE-apparaten gevonden. De scan heeft geen advertenties ontvangen.</li>");
   page += F("</ul><a class='button' href='/'>Terug</a></body></html>");
   scanner->clearResults();
@@ -367,8 +395,9 @@ void readOneSensor(size_t index) {
     sensorStatus[index] = "BLE-client kon niet worden aangemaakt";
     return;
   }
-  if (!client->connect(NimBLEAddress(std::string(sensors[index].address.c_str()), BLE_ADDR_PUBLIC))) {
-    sensorStatus[index] = "BLE-verbinding mislukt";
+  const NimBLEAddress address(std::string(sensors[index].address.c_str()), sensors[index].addressType);
+  if (!client->connect(address)) {
+    sensorStatus[index] = String("BLE-verbinding mislukt (adrestype ") + sensors[index].addressType + ")";
     NimBLEDevice::deleteClient(client);
     return;
   }
