@@ -254,17 +254,34 @@ void handleScan() {
   scanner->clearResults();
   NimBLEScanResults found = scanner->getResults(5, false);
   String page = pageStart("CTEK-apparaten zoeken");
-  page += F("<p>Gevonden CTEK-apparaten (BLE-adresprefix 2C:FC:E4):</p><ul>");
-  size_t shown = 0;
+  page += F("<p>BLE-apparaten gevonden: ");
+  page += String(found.getCount());
+  page += F(". CTEK-herkenning gebruikt adresprefix 2C:FC:E4.</p><ul>");
   for (int i = 0; i < found.getCount(); ++i) {
     const NimBLEAdvertisedDevice* device = found.getDevice(i);
     String address = normalizeAddress(device->getAddress().toString().c_str());
-    if (!isCtekAddress(address)) continue;
+    String name = device->getName().c_str();
+    Serial.printf("[SCAN] %s %s RSSI=%d\n", address.c_str(), name.c_str(), device->getRSSI());
+    if (!isCtekAddress(address)) {
+      page += F("<li>");
+      page += escapeHtml(name.isEmpty() ? String("(geen naam)") : name);
+      page += F(" | ");
+      page += escapeHtml(address);
+      page += F(" | RSSI ");
+      page += String(device->getRSSI());
+      page += F(" | geen CTEK-adresprefix</li>");
+      continue;
+    }
     bool exists = false;
     for (const Sensor& sensor : sensors) exists |= sensor.address == address;
-    if (exists || sensors.size() >= kMaxSensors) continue;
-    ++shown;
-    String name = device->getName().c_str();
+    if (exists || sensors.size() >= kMaxSensors) {
+      page += F("<li>");
+      page += escapeHtml(name.isEmpty() ? String("CTEK Battery Sense") : name);
+      page += F(" | ");
+      page += escapeHtml(address);
+      page += exists ? F(" | al toegevoegd</li>") : F(" | maximum bereikt</li>");
+      continue;
+    }
     page += F("<li><form method='post' action='/add'><strong>");
     page += escapeHtml(name.isEmpty() ? String("CTEK Battery Sense") : name);
     page += F("</strong> "); page += escapeHtml(address);
@@ -272,7 +289,7 @@ void handleScan() {
     page += F("'><label>Naam<input name='name' value='"); page += escapeHtml(name);
     page += F("'></label><label>Verbindingscode (16 tekens)<input name='code' required minlength='16' maxlength='16' autocomplete='off'></label><button type='submit'>Toevoegen</button></form></li>");
   }
-  if (!shown) page += F("<li>Geen nieuwe CTEK Battery Sense gevonden. Breng het apparaat dichterbij en probeer opnieuw.</li>");
+  if (found.getCount() == 0) page += F("<li>Geen BLE-apparaten gevonden. De scan heeft geen advertenties ontvangen.</li>");
   page += F("</ul><a class='button' href='/'>Terug</a></body></html>");
   scanner->clearResults();
   web.send(200, "text/html; charset=utf-8", page);
