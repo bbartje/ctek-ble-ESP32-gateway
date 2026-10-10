@@ -252,7 +252,7 @@ void handleScan() {
   NimBLEScan* scanner = NimBLEDevice::getScan();
   scanner->stop();
   scanner->clearResults();
-  NimBLEScanResults found = scanner->getResults(5, false);
+  NimBLEScanResults found = scanner->getResults(10000, false);
   String page = pageStart("CTEK-apparaten zoeken");
   page += F("<p>BLE-apparaten gevonden: ");
   page += String(found.getCount());
