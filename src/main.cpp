@@ -22,6 +22,7 @@ constexpr char kTemperatureUuid[] = "B5634099-97C4-4F37-ADF3-771246E77754";
 constexpr char kDevicePrefix[] = "2C:FC:E4";
 constexpr size_t kMaxSensors = 8;
 constexpr uint32_t kListenDurationMs = 8000;
+constexpr uint32_t kBleConnectTimeoutMs = 7000;
 
 struct Sensor {
   String address;
@@ -164,7 +165,11 @@ void publishPending() {
     state["temperature"] = reading.temperature;
     String payload;
     serializeJson(state, payload);
-    mqtt.publish(stateTopic(i).c_str(), payload.c_str(), true);
+    if (!mqtt.publish(stateTopic(i).c_str(), payload.c_str(), true)) {
+      portENTER_CRITICAL(&readingMux);
+      readings[i].pending = true;
+      portEXIT_CRITICAL(&readingMux);
+    }
   }
 }
 
@@ -362,6 +367,8 @@ void startProvisioning() {
 void configureMqtt() {
   availabilityTopic = "ctek_gateway/" + gatewayId() + "/availability";
   mqtt.setServer(mqttHost.c_str(), mqttPort);
+  mqtt.setKeepAlive(60);
+  mqtt.setSocketTimeout(5);
   mqtt.setBufferSize(1024);
 }
 
@@ -400,6 +407,7 @@ void readOneSensor(size_t index) {
     sensorStatus[index] = "BLE-client kon niet worden aangemaakt";
     return;
   }
+  client->setConnectTimeout(kBleConnectTimeoutMs);
   const NimBLEAddress address(std::string(sensors[index].address.c_str()), sensors[index].addressType);
   if (!client->connect(address)) {
     const int error = client->getLastError();
