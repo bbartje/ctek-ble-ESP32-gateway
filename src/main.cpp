@@ -291,7 +291,9 @@ void handleScan() {
     String address = normalizeAddress(bleAddress.toString().c_str());
     const uint8_t addressType = bleAddress.getType();
     String name = device->getName().c_str();
-    Serial.printf("[SCAN] %s %s RSSI=%d type=%u\n", address.c_str(), name.c_str(), device->getRSSI(), addressType);
+    const bool connectable = device->isConnectable();
+    Serial.printf("[SCAN] %s %s RSSI=%d type=%u connectable=%u\n",
+            address.c_str(), name.c_str(), device->getRSSI(), addressType, connectable);
     if (!isCtekAddress(address)) {
       page += F("<li>");
       page += escapeHtml(name.isEmpty() ? String("(geen naam)") : name);
@@ -299,7 +301,8 @@ void handleScan() {
       page += escapeHtml(address);
       page += F(" | RSSI ");
       page += String(device->getRSSI());
-      page += F(" | geen CTEK-adresprefix</li>");
+      page += connectable ? F(" | verbindbaar | geen CTEK-adresprefix</li>")
+              : F(" | niet verbindbaar | geen CTEK-adresprefix</li>");
       continue;
     }
     bool exists = false;
@@ -318,13 +321,15 @@ void handleScan() {
       page += escapeHtml(address);
       page += F(" (");
       page += String(addressType);
-      page += exists ? F(") | al toegevoegd</li>") : F(") | maximum bereikt</li>");
+      page += connectable ? F(") | verbindbaar") : F(") | niet verbindbaar");
+      page += exists ? F(" | al toegevoegd</li>") : F(" | maximum bereikt</li>");
       continue;
     }
     page += F("<li><form method='post' action='/add'><strong>");
     page += escapeHtml(name.isEmpty() ? String("CTEK Battery Sense") : name);
     page += F("</strong> "); page += escapeHtml(address);
     page += F(" ("); page += String(addressType); page += F(")");
+    page += connectable ? F(" | verbindbaar") : F(" | niet verbindbaar");
     page += F("<input type='hidden' name='address' value='"); page += escapeHtml(address);
     page += F("'><input type='hidden' name='address_type' value='"); page += String(addressType);
     page += F("'><label>Naam<input name='name' value='"); page += escapeHtml(name);
@@ -397,7 +402,12 @@ void readOneSensor(size_t index) {
   }
   const NimBLEAddress address(std::string(sensors[index].address.c_str()), sensors[index].addressType);
   if (!client->connect(address)) {
-    sensorStatus[index] = String("BLE-verbinding mislukt (adrestype ") + sensors[index].addressType + ")";
+    const int error = client->getLastError();
+    const char* errorText = NimBLEUtils::returnCodeToString(error);
+    sensorStatus[index] = String("BLE-verbinding mislukt (adrestype ") + sensors[index].addressType +
+      String(", fout ") + error + ": " + errorText + ")";
+    Serial.printf("[BLE] connect %s type=%u failed: %d %s\n", sensors[index].address.c_str(),
+            sensors[index].addressType, error, errorText);
     NimBLEDevice::deleteClient(client);
     return;
   }
