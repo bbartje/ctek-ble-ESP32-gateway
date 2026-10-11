@@ -43,6 +43,7 @@ PubSubClient mqtt(wifiClient);
 std::vector<Sensor> sensors;
 std::array<Reading, kMaxSensors> readings;
 std::array<String, kMaxSensors> sensorStatus;
+std::array<String, kMaxSensors> sensorDebug;
 std::array<uint32_t, kMaxSensors> lastSampleMs{};
 portMUX_TYPE readingMux = portMUX_INITIALIZER_UNLOCKED;
 volatile int activeSensor = -1;
@@ -61,6 +62,35 @@ String escapeHtml(const String& value) {
     else output += ch;
   }
   return output;
+}
+
+void logSensor(size_t index, const String& message) {
+  String line = String(millis()) + "ms " + message + "\n";
+  sensorDebug[index] += line;
+  if (sensorDebug[index].length() > 3000)
+    sensorDebug[index].remove(0, sensorDebug[index].length() - 3000);
+  Serial.printf("[BLE][%s] %s", sensors[index].address.c_str(), line.c_str());
+}
+
+String valueHex(const NimBLEAttValue& value) {
+  String hex;
+  for (size_t i = 0; i < value.size(); ++i) {
+    char byteText[4];
+    snprintf(byteText, sizeof(byteText), "%02X", value[i]);
+    if (!hex.isEmpty()) hex += ' ';
+    hex += byteText;
+  }
+  return hex;
+}
+
+void logCharacteristic(size_t index, NimBLERemoteCharacteristic* characteristic) {
+  String detail = String("characteristic ") + characteristic->getUUID().toString().c_str();
+  detail += String(" read=") + characteristic->canRead();
+  detail += String(" write=") + characteristic->canWrite();
+  detail += String(" writeNoResp=") + characteristic->canWriteNoResponse();
+  detail += String(" notify=") + characteristic->canNotify();
+  detail += String(" indicate=") + characteristic->canIndicate();
+  logSensor(index, detail);
 }
 
 String normalizeAddress(String address) { address.toUpperCase(); return address; }
@@ -214,7 +244,23 @@ void handleRoot() {
     page += escapeHtml(sensors[i].address); page += F(") <a href='/remove?i=");
     page += String(i); page += F("'>verwijderen</a><br><small>");
     page += escapeHtml(sensorStatus[i].isEmpty() ? String("Nog geen uitleespoging") : sensorStatus[i]);
-    page += F("</small></li>");
+    page += F("</small>");
+    if (lastSampleMs[i] != 0) {
+      Reading reading;
+      portENTER_CRITICAL(&readingMux);
+      reading = readings[i];
+      portEXIT_CRITICAL(&readingMux);
+      page += F("<br><small>Laatste waarde: ");
+      page += String(reading.voltage, 3);
+      page += F(" V, ");
+      page += String(reading.temperature, 1);
+      page += F(" °C; ");
+      page += String((millis() - lastSampleMs[i]) / 1000);
+      page += F(" s geleden</small>");
+    }
+    page += F("<details><summary>BLE-debuglog</summary><pre>");
+    page += escapeHtml(sensorDebug[i]);
+    page += F("</pre></details></li>");
   }
   page += F("</ul><small>Configuratie wordt lokaal op de gateway bewaard.</small></body></html>");
   web.send(200, "text/html; charset=utf-8", page);
@@ -314,6 +360,8 @@ void handleScan() {
     for (Sensor& sensor : sensors) {
       if (sensor.address != address) continue;
       exists = true;
+        logSensor(&sensor - sensors.data(), String("scan RSSI=") + device->getRSSI() +
+                  " addressType=" + addressType + " connectable=" + connectable);
       if (sensor.addressType != addressType) {
         sensor.addressType = addressType;
         savedAddressTypeChanged = true;
@@ -395,16 +443,23 @@ void onBatterySamples(NimBLERemoteCharacteristic*, uint8_t* data, size_t length,
     readings[index].temperature = static_cast<int8_t>(data[offset + 2]) / 2.0f;
     readings[index].pending = true;
     lastSampleMs[index] = millis();
+    Serial.printf("[BLE][%s] notify len=%u raw=%02X %02X %02X voltage=%.3fV temp=%.1fC\n",
+            sensors[index].address.c_str(), static_cast<unsigned>(length),
+            data[offset], data[offset + 1], data[offset + 2],
+            readings[index].voltage, readings[index].temperature);
   }
   portEXIT_CRITICAL(&readingMux);
 }
 
 void readOneSensor(size_t index) {
+  sensorDebug[index] = "";
   sensorStatus[index] = "Bezig met BLE-verbinding";
+  logSensor(index, String("connect start, addressType=") + sensors[index].addressType);
   if (WiFi.status() == WL_CONNECTED) mqtt.loop();
   NimBLEClient* client = NimBLEDevice::createClient();
   if (!client) {
     sensorStatus[index] = "BLE-client kon niet worden aangemaakt";
+    logSensor(index, "createClient failed");
     return;
   }
   client->setConnectTimeout(kBleConnectTimeoutMs);
@@ -416,25 +471,37 @@ void readOneSensor(size_t index) {
       String(", fout ") + error + ": " + errorText + ")";
     Serial.printf("[BLE] connect %s type=%u failed: %d %s\n", sensors[index].address.c_str(),
             sensors[index].addressType, error, errorText);
+    logSensor(index, String("connect failed: ") + error + " " + errorText);
     NimBLEDevice::deleteClient(client);
     return;
   }
+  logSensor(index, String("connected; MTU=") + client->getMTU());
   NimBLERemoteService* service = client->getService(NimBLEUUID(kServiceUuid));
   if (!service) {
     sensorStatus[index] = "Verbonden, maar CTEK GATT-service niet gevonden";
+    logSensor(index, "expected CTEK service not found; discovered services:");
+    for (NimBLERemoteService* foundService : client->getServices())
+      logSensor(index, String("service ") + foundService->getUUID().toString().c_str());
     client->disconnect();
     NimBLEDevice::deleteClient(client);
     return;
   }
+  logSensor(index, String("CTEK service found: ") + service->getUUID().toString().c_str());
+  for (NimBLERemoteCharacteristic* characteristic : service->getCharacteristics())
+    logCharacteristic(index, characteristic);
   NimBLERemoteCharacteristic* unlock = service->getCharacteristic(NimBLEUUID(kUnlockUuid));
   NimBLERemoteCharacteristic* samples = service->getCharacteristic(NimBLEUUID(kSamplesUuid));
   if (!unlock || !samples) {
     sensorStatus[index] = "CTEK GATT-characteristieken ontbreken";
+    logSensor(index, String("required characteristics missing; unlock=") + (unlock != nullptr) +
+              " samples=" + (samples != nullptr));
     client->disconnect();
     NimBLEDevice::deleteClient(client);
     return;
   }
-  if (!unlockSensor(unlock, sensors[index].code)) {
+  const bool unlockWritten = unlockSensor(unlock, sensors[index].code);
+  logSensor(index, String("unlock write=") + unlockWritten);
+  if (!unlockWritten) {
     sensorStatus[index] = "Unlock-write mislukt; controleer de verbindingscode";
     client->disconnect();
     NimBLEDevice::deleteClient(client);
@@ -448,35 +515,47 @@ void readOneSensor(size_t index) {
     if (WiFi.status() == WL_CONNECTED) mqtt.loop();
     delay(20);
   }
-  if (auto* clock = service->getCharacteristic(NimBLEUUID(kClockUuid))) clock->readValue();
-  if (auto* period = service->getCharacteristic(NimBLEUUID(kPeriodUuid))) period->readValue();
+  if (auto* clock = service->getCharacteristic(NimBLEUUID(kClockUuid))) {
+    NimBLEAttValue value = clock->readValue();
+    logSensor(index, String("clock read len=") + value.size() + " raw=" + valueHex(value));
+  } else logSensor(index, "clock characteristic missing");
+  if (auto* period = service->getCharacteristic(NimBLEUUID(kPeriodUuid))) {
+    NimBLEAttValue value = period->readValue();
+    logSensor(index, String("period read len=") + value.size() + " raw=" + valueHex(value));
+  } else logSensor(index, "period characteristic missing");
   uint16_t historyCursor = 0;
   if (auto* cursor = service->getCharacteristic(NimBLEUUID(kCursorUuid))) {
     NimBLEAttValue value = cursor->readValue();
     if (value.size() >= 2)
       historyCursor = static_cast<uint16_t>(value[0]) | (static_cast<uint16_t>(value[1]) << 8);
-  }
+    logSensor(index, String("cursor read len=") + value.size() + " raw=" + valueHex(value) +
+              " decoded=" + historyCursor);
+  } else logSensor(index, "cursor characteristic missing");
   if (auto* temperature = service->getCharacteristic(NimBLEUUID(kTemperatureUuid))) {
     NimBLEAttValue value = temperature->readValue();
+    logSensor(index, String("temperature read len=") + value.size() + " raw=" + valueHex(value));
     if (value.size()) {
       portENTER_CRITICAL(&readingMux);
       readings[index].temperature = static_cast<int8_t>(value[0]) / 2.0f;
       portEXIT_CRITICAL(&readingMux);
     }
-  }
+  } else logSensor(index, "temperature characteristic missing");
   activeSensor = static_cast<int>(index);
   const uint32_t previousSampleMs = lastSampleMs[index];
   const bool subscribed = samples->canNotify() && samples->subscribe(true, onBatterySamples, true);
+  logSensor(index, String("notify supported=") + samples->canNotify() + " subscribe=" + subscribed);
   sensorStatus[index] = subscribed ? "Voltage-notificaties actief; wachten op meting" : "Voltage-notificaties inschakelen mislukt";
   if (subscribed && historyCursor > 0) {
     if (auto* range = service->getCharacteristic(NimBLEUUID(kRangeUuid))) {
       const uint16_t firstSample = historyCursor - 1;
       const uint8_t request[] = {3, static_cast<uint8_t>(firstSample),
                                  static_cast<uint8_t>(firstSample >> 8), 1, 0};
-      if (!range->writeValue(request, sizeof(request), true))
+      const bool rangeWritten = range->writeValue(request, sizeof(request), true);
+      logSensor(index, String("range write first=") + firstSample + " count=1 result=" + rangeWritten);
+      if (!rangeWritten)
         sensorStatus[index] = "Meetdata-opvraag mislukt";
-    }
-  }
+    } else logSensor(index, "range characteristic missing");
+  } else logSensor(index, String("range request skipped; cursor=") + historyCursor);
   uint32_t started = millis();
   while (millis() - started < kListenDurationMs && client->isConnected()) {
     web.handleClient();
@@ -484,9 +563,18 @@ void readOneSensor(size_t index) {
     publishPending();
     delay(20);
   }
-  sensorStatus[index] = lastSampleMs[index] != previousSampleMs
-      ? "Meetnotificatie ontvangen"
-      : String("Geen voltage-notificatie ontvangen (cursor ") + historyCursor + ")";
+  if (lastSampleMs[index] != previousSampleMs) {
+    Reading reading;
+    portENTER_CRITICAL(&readingMux);
+    reading = readings[index];
+    portEXIT_CRITICAL(&readingMux);
+    sensorStatus[index] = String("Meetnotificatie ontvangen: ") + String(reading.voltage, 3) + " V, " +
+                          String(reading.temperature, 1) + " C";
+    logSensor(index, sensorStatus[index]);
+  } else {
+    sensorStatus[index] = String("Geen voltage-notificatie ontvangen (cursor ") + historyCursor + ")";
+    logSensor(index, sensorStatus[index]);
+  }
   activeSensor = -1;
   if (client->isConnected()) client->disconnect();
   NimBLEDevice::deleteClient(client);

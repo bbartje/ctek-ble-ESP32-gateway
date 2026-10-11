@@ -32,6 +32,10 @@ na elkaar uitleest en met MQTT Discovery aan Home Assistant aanbiedt.
 	temperatuursensor. De gateway gebruikt maximaal acht monitors en verbindt
 	telkens met één monitor tegelijk.
 
+Bij BLE-problemen open je op de gatewaypagina **BLE-debuglog** onder de
+betreffende monitor. Dit log bevat scan-/GATT-stappen en ruwe meetbytes, maar
+geen verbindingscode.
+
 Na de eerste configuratie is de webpagina bereikbaar op het IP-adres dat de
 router aan de gateway heeft toegekend. Bij een mislukte Wi-Fi-verbinding start
 de configuratie-AP opnieuw.
